@@ -17,6 +17,7 @@ not enable pytest-asyncio auto mode).
 
 import argparse
 import asyncio
+import io
 import os
 import subprocess
 import sys
@@ -577,31 +578,36 @@ class _FakeCfg:
         return cls()
 
 
+@pytest.fixture
+def gw(monkeypatch, tmp_path):
+    """Minimal ``_gateway()`` harness: stub every startup side-effect it
+    performs before handing off to ``run_gateway``, shared by ``TestGateway``
+    and ``TestGatewayStdoutBuffering``.
+    """
+    captured: dict = {}
+
+    async def _run_gateway(cfg, **kw):
+        captured["cfg"] = cfg
+        captured["kw"] = kw
+
+    monkeypatch.setattr(cli_server, "run_gateway", _run_gateway)
+    monkeypatch.setattr(cli_server, "activate_mise", lambda: [])
+    monkeypatch.setattr(cli_server, "ensure_dev_dist_symlink", lambda: tmp_path / "dist")
+    monkeypatch.setattr(cli_server, "_should_reconcile_launchd_launcher", lambda: False)
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli_server, "config_path", lambda: cfg_file)
+
+    class _Cfg(_FakeCfg):
+        saved = 0
+
+    monkeypatch.setattr(cli_server, "KiroCrewConfig", _Cfg)
+    monkeypatch.setattr("kiro_crew.cli._node_ok", lambda: True)
+    return captured, _Cfg
+
+
 class TestGateway:
     """Start-up reconciliation runs, then ``run_gateway`` receives the flags verbatim."""
-
-    @pytest.fixture
-    def gw(self, monkeypatch, tmp_path):
-        captured: dict = {}
-
-        async def _run_gateway(cfg, **kw):
-            captured["cfg"] = cfg
-            captured["kw"] = kw
-
-        monkeypatch.setattr(cli_server, "run_gateway", _run_gateway)
-        monkeypatch.setattr(cli_server, "activate_mise", lambda: [])
-        monkeypatch.setattr(cli_server, "ensure_dev_dist_symlink", lambda: tmp_path / "dist")
-        monkeypatch.setattr(cli_server, "_should_reconcile_launchd_launcher", lambda: False)
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(cli_server, "config_path", lambda: cfg_file)
-
-        class _Cfg(_FakeCfg):
-            saved = 0
-
-        monkeypatch.setattr(cli_server, "KiroCrewConfig", _Cfg)
-        monkeypatch.setattr("kiro_crew.cli._node_ok", lambda: True)
-        return captured, _Cfg
 
     def test_flags_are_forwarded_to_run_gateway(self, gw) -> None:
         captured, cfg_cls = gw
@@ -667,6 +673,77 @@ class TestGateway:
         with caplog.at_level("WARNING", logger="kiro_crew.cli_server"):
             asyncio.run(cli_server._gateway(no_dashboard=True))
         assert any("live-gateway launcher" in r.message for r in caplog.records)
+        assert "kw" in captured  # the gateway still started
+
+
+class _FakeStdout(io.StringIO):
+    """A stand-in for ``sys.stdout`` with a controllable ``isatty()``.
+
+    Subclasses ``StringIO`` so an ordinary ``print()`` elsewhere in
+    ``_gateway`` (e.g. "Created default config") has somewhere real to go
+    instead of crashing the test; ``reconfigure`` is added only when
+    requested, to also cover a stdout replacement that lacks it entirely
+    (matching the defensive ``getattr(..., "reconfigure", None)`` guard in
+    the product code, needed because ``sys.stdout``'s static type does not
+    guarantee the method — see the ``cli_server`` fix).
+    """
+
+    def __init__(self, *, is_tty: bool, with_reconfigure: bool = True) -> None:
+        super().__init__()
+        self._is_tty = is_tty
+        self.reconfigure_calls: list[dict] = []
+        if with_reconfigure:
+            self.reconfigure = self._reconfigure  # type: ignore[assignment]
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+    def _reconfigure(self, **kwargs: object) -> None:
+        self.reconfigure_calls.append(kwargs)
+
+
+class TestGatewayStdoutBuffering:
+    """``_gateway`` must make stdout line-buffered off a live console.
+
+    Reproduces a real Windows bug: the gateway's startup banner — including
+    the ONE dashboard URL carrying the auth token a browser needs to pass the
+    setup gate — is printed via plain ``print()``. Off a TTY (piped, log-
+    redirected, ``--detached``, any non-interactive launcher), Python fully
+    block-buffers stdout and nothing flushes it for a long-running process,
+    so that URL sat in an unflushed buffer forever and a forceful stop
+    discarded it before it was ever written out. The dashboard then had no
+    way to authenticate and every API call 403'd — surfacing to a user as an
+    unrelated-looking "Setup check unavailable" / "We could not check Kiro
+    CLI" screen.
+    """
+
+    def test_reconfigures_stdout_to_line_buffered_when_not_a_tty(
+        self, gw, monkeypatch
+    ) -> None:
+        fake = _FakeStdout(is_tty=False)
+        monkeypatch.setattr(sys, "stdout", fake)
+
+        asyncio.run(cli_server._gateway(no_dashboard=True))
+
+        assert fake.reconfigure_calls == [{"line_buffering": True}]
+
+    def test_does_not_reconfigure_an_interactive_console(self, gw, monkeypatch) -> None:
+        fake = _FakeStdout(is_tty=True)
+        monkeypatch.setattr(sys, "stdout", fake)
+
+        asyncio.run(cli_server._gateway(no_dashboard=True))
+
+        assert fake.reconfigure_calls == []
+
+    def test_tolerates_a_stdout_without_reconfigure(self, gw, monkeypatch) -> None:
+        # A replaced stdout (e.g. a custom log-tee, or a stream type that
+        # predates TextIOWrapper.reconfigure) must not crash the gateway.
+        fake = _FakeStdout(is_tty=False, with_reconfigure=False)
+        monkeypatch.setattr(sys, "stdout", fake)
+
+        asyncio.run(cli_server._gateway(no_dashboard=True))  # must not raise
+
+        captured, _ = gw
         assert "kw" in captured  # the gateway still started
 
 
