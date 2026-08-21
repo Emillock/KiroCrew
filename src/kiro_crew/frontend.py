@@ -397,14 +397,22 @@ def build_and_stage(
 
 
 def _discard_path(path: Path) -> None:
-    """Best-effort remove a file, symlink or directory.
+    """Best-effort remove a file, symlink, junction or directory.
 
-    A staged-aside entry can be any of the three — ``static/dist`` is a symlink
-    on a source install and a real tree once staged — and ``shutil.rmtree``
-    refuses a symlink even though ``is_dir()`` follows it and returns True.
+    A staged-aside entry can be any of these — ``static/dist`` is a symlink or
+    (on Windows) a directory junction on a source install
+    (:func:`ensure_dev_dist_symlink`), and a real tree once staged.
+    ``shutil.rmtree`` refuses a symlink even though ``is_dir()`` follows it and
+    returns True, but a junction is invisible to ``is_symlink()`` — a plain
+    ``is_symlink()`` check here would fall through to ``shutil.rmtree`` and
+    delete the junction's TARGET contents (the real ``website/dist`` build
+    output) instead of just the link, so the junction/symlink case is checked
+    with :func:`platform_compat.is_link_or_junction` first.
     """
     try:
-        if path.is_symlink() or path.is_file():
+        if platform_compat.is_link_or_junction(path):
+            platform_compat.unlink_link_or_junction(path)
+        elif path.is_file():
             path.unlink(missing_ok=True)
         elif path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
