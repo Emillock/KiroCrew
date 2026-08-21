@@ -3182,6 +3182,91 @@ class TestKiroPrerequisiteWorkflow:
 
         assert tracked == {9876: 9002}
 
+    @pytest.mark.asyncio
+    async def test_windows_descendant_snapshot_race_does_not_fail_a_successful_probe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A Windows descendant-handle race must not fail an already-successful probe.
+
+        Reproduces a real readiness-gate false negative: kiro-cli's
+        ``--version`` genuinely exits 0 and its stdout is fully captured, but
+        the retained root handle's initial identity re-read fails (observed as
+        ``descendant_termination_handles: root handle identity mismatch`` when
+        the exit FILETIME had not yet been published — e.g. a security scanner
+        still inspecting a freshly-installed binary). That raised the
+        exception all the way out of ``_run_process``, discarding the real
+        exit code and output and reporting the CLI as "not installed" even
+        though it plainly ran. The descendant tracker exists only to retain
+        handles for ``_terminate_process``'s cleanup on a later timeout/
+        cancel; it must never be the authority on whether THIS probe
+        succeeded — that is ``proc.wait()`` and the captured stdout.
+        """
+
+        class _ByteStream:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+                self._sent = False
+
+            async def read(self, _size: int) -> bytes:
+                if self._sent:
+                    return b""
+                self._sent = True
+                return self._data
+
+        class _FastExitParent:
+            pid = 37008
+            returncode: int | None = None
+            stdin = None
+
+            def __init__(self) -> None:
+                self.stdout = _ByteStream(b"kiro-cli-chat 2.16.2\n")
+                self.stderr = _ByteStream(b"")
+
+            async def wait(self) -> int:
+                self.returncode = 0
+                return 0
+
+        async def spawn(*_args: str, **_kwargs: Any) -> _FastExitParent:
+            return _FastExitParent()
+
+        snapshot_calls = 0
+
+        async def descendants(
+            _root_pid: int,
+            _retained_handles: dict[int, int] | None = None,
+            _root_handle: int | None = None,
+        ) -> dict[int, int]:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            raise ValueError(
+                "descendant_termination_handles: root handle identity mismatch"
+            )
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(
+            platform_compat, "descendant_termination_handles_async", descendants
+        )
+        monkeypatch.setattr(
+            platform_compat, "duplicate_asyncio_process_handle", lambda _proc: 8001
+        )
+        monkeypatch.setattr(platform_compat, "close_process_handle", lambda _h: None)
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+
+        result = await _run_process(
+            r"C:\fixed\kiro-cli.exe",
+            ["--version"],
+            env={},
+            timeout_secs=5,
+        )
+
+        assert snapshot_calls >= 1
+        assert result.ok is True
+        assert result.returncode == 0
+        assert result.output == "kiro-cli-chat 2.16.2\n"
+        assert result.sandbox_failure is None
+
 
 class TestKiroPrerequisiteHandlers:
     @staticmethod
