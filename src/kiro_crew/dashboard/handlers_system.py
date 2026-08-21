@@ -399,6 +399,10 @@ def _scan_mcp_processes() -> dict[str, object]:
               image. The final cmdline becomes "kiro-cli ..." and the
               "kirocrew_sandbox" string (only in the -f path arg) is lost.
               Sandbox count will be 0 even when sandboxes are running.
+      Windows: there is no OS sandbox backend (nothing to count) and no `ps`
+              binary — a full per-process command line is not cheaply
+              available even via ctypes (see process_matches). Skipped
+              entirely rather than shelling out to a `ps` that doesn't exist.
     """
     try:
         _my = os.getpid()
@@ -421,7 +425,7 @@ def _scan_mcp_processes() -> dict[str, object]:
                         _seen.add(d)
                 except OSError:
                     pass
-        else:
+        elif sys.platform == "darwin":
             _sigs = {
                 "kirocrew_sandbox": "sandbox",
                 "kiro-cli": "kiro_cli",
