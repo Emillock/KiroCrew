@@ -21,6 +21,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew import platform_compat
+
 
 @pytest.fixture
 def fake_home(tmp_path, monkeypatch):
@@ -250,6 +252,50 @@ class TestDiscoverInstall:
             assert (link / "SKILL.md").exists()
             # ...and NOTHING landed at the old symlink target.
             assert list(outside.iterdir()) == []
+        finally:
+            await client.close()
+
+    async def test_install_overwrite_replaces_a_linked_skill_dir_without_deleting_the_target(
+        self, fake_home, reset_registry, tmp_path
+    ):
+        # Regression test: the containment defense above used to check only
+        # ``is_symlink()``, which is False for a Windows directory junction —
+        # the same reparse-point mechanism an app's own skill registration
+        # creates at this exact path shape (apps/bridges.py). A junction
+        # would sail through that check untouched, so the overwrite path's
+        # bare ``shutil.rmtree(skill_dir)`` would then either raise (modern
+        # Windows Python refuses to rmtree a reparse point) or, depending on
+        # platform/version, recurse through the junction and delete the
+        # target's real contents — either way breaking the exact overwrite
+        # this endpoint exists to support. Uses ``symlink_or_junction`` (a
+        # real symlink on POSIX, an unprivileged junction on Windows) so this
+        # exercises the exact link type the bug needs on whichever platform
+        # runs it.
+        client, skills_dir = await self._client(fake_home)
+        try:
+            outside = tmp_path / "outside-target"
+            outside.mkdir()
+            (outside / "do-not-delete.txt").write_text("precious")
+            provider_dir = skills_dir / "fakeprov"
+            provider_dir.mkdir(parents=True, exist_ok=True)
+            link = provider_dir / "fake-skill"
+            platform_compat.symlink_or_junction(str(outside), str(link))
+            assert platform_compat.is_link_or_junction(link)
+
+            resp = await client.post(
+                "/api/skills/-/discover/install",
+                json={
+                    "provider": "fakeprov",
+                    "skill_id": "fake-skill",
+                    "overwrite": True,
+                },
+            )
+            assert resp.status == 200
+            # The link was replaced by a real directory...
+            assert not platform_compat.is_link_or_junction(link)
+            assert (link / "SKILL.md").exists()
+            # ...and the link's ORIGINAL TARGET survived untouched.
+            assert (outside / "do-not-delete.txt").read_text() == "precious"
         finally:
             await client.close()
 

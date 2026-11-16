@@ -1347,6 +1347,17 @@ async def _gateway(
     test_mode: bool = False,
 ) -> None:
     """Load config and start the gateway (dashboard + configured messaging channels)."""
+    # stdout is fully block-buffered (not line-buffered) whenever it is not a
+    # live console — piped into a log file, redirected by `kirocrew gateway
+    # --detached`, or captured by any non-interactive launcher. The gateway is
+    # long-running and its startup banner (notably the dashboard URL with the
+    # one-time auth token a browser needs to pass the setup gate) is otherwise
+    # sitting in that buffer indefinitely: nothing later in this process forces
+    # a flush, so a forceful stop (`kirocrew stop`, a service manager, a killed
+    # terminal) can discard it before it is ever written out.
+    _reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if not sys.stdout.isatty() and callable(_reconfigure):
+        _reconfigure(line_buffering=True)
     # Activate mise once at gateway start so every subprocess we
     # later spawn — MCP servers, script crons, kiro-cli — inherits the user's
     # mise-managed toolchain. Without this, Node-based MCP servers spawn against

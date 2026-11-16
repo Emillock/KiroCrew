@@ -617,6 +617,72 @@ class TestSecurity:
         other = tarfile.TarInfo(name="snap/trust/notes.txt")
         assert _data_filter(other) is not None
 
+    def test_copytree_safe_skips_a_link_and_its_contents(self, tmp_path):
+        """``_copytree_safe`` must not leak a linked directory's contents.
+
+        Regression test: its ignore filter used to check ``os.path.islink``,
+        which is False for a Windows directory junction — the same
+        reparse-point mechanism this codebase creates all over
+        ``~/.kiro/crew/skills/`` for every app-registered skill (see
+        ``apps/bridges.py``). A junction there would sail through the filter
+        untouched and get copied THROUGH into the snapshot archive, leaking
+        whatever it points at — exactly what this function exists to
+        prevent. Uses ``symlink_or_junction`` (a real symlink on POSIX, an
+        unprivileged junction on Windows) so this exercises the exact link
+        type the bug needs on whichever platform runs it.
+        """
+        from kiro_crew import platform_compat
+        from kiro_crew.snapshot import _copytree_safe
+
+        sensitive = tmp_path / "sensitive_target"
+        sensitive.mkdir()
+        (sensitive / "secret.txt").write_text("SENSITIVE DATA")
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "normal.txt").write_text("normal file")
+        platform_compat.symlink_or_junction(str(sensitive), str(src / "linked_dir"))
+
+        dst = tmp_path / "dst"
+        _copytree_safe(src, dst)
+
+        assert (dst / "normal.txt").read_text() == "normal file"
+        assert not (dst / "linked_dir").exists(), "the link itself must not be copied"
+        assert not (dst / "linked_dir" / "secret.txt").exists(), "leaked the link's target"
+
+    def test_copy_tree_no_overwrite_skips_a_link_and_its_contents(self, tmp_path):
+        """``_copy_tree_no_overwrite`` must prune a link, not just skip its entry.
+
+        Regression test: it used to walk with ``Path.rglob("*")`` and skip
+        only items themselves reported as ``is_symlink()``. That check is
+        False for a Windows junction, AND — even fixed to detect one —
+        skipping the top-level entry alone is not enough: ``rglob`` has
+        already queued the linked directory's children as separate, ordinary
+        -looking paths, so they are yielded (and copied) regardless of a
+        per-item skip. Restore uses this for the ``skills`` component
+        (a merge/no-overwrite copy from an extracted snapshot), so the fix
+        instead prunes the walk itself via ``os.walk``.
+        """
+        from kiro_crew import platform_compat
+        from kiro_crew.snapshot import _copy_tree_no_overwrite
+
+        sensitive = tmp_path / "sensitive_target"
+        sensitive.mkdir()
+        (sensitive / "secret.txt").write_text("SENSITIVE DATA")
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "normal.txt").write_text("normal file")
+        platform_compat.symlink_or_junction(str(sensitive), str(src / "linked_dir"))
+
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        _copy_tree_no_overwrite(src, dst)
+
+        assert (dst / "normal.txt").read_text() == "normal file"
+        assert not (dst / "linked_dir").exists(), "the link itself must not be copied"
+        assert not (dst / "linked_dir" / "secret.txt").exists(), "leaked the link's target"
+
     def test_symlink_filtered_out(self, env, monkeypatch):
         """TEST 30 — symlinks are silently dropped by _data_filter."""
         src, _, _, tmp_path = env

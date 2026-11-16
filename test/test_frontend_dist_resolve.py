@@ -386,6 +386,43 @@ def test_stage_built_dist_replaces_symlink_with_real_copy(tmp_path):
     assert (static_dist / "index.html").is_file()
 
 
+def test_stage_built_dist_replaces_a_link_without_deleting_its_target(tmp_path):
+    """static/dist LINKED (a directory junction on Windows) stages cleanly
+    without deleting what it was linked to.
+
+    Regression test for ``_discard_path``: it used to check only
+    ``is_symlink()``, which is False for a Windows directory junction.
+    Staging renames the live static/dist aside as a backup and discards that
+    backup once the new bundle is published — for a junction, ``is_symlink()``
+    missed it, ``_discard_path`` fell through to ``shutil.rmtree``, and that
+    silently deleted the junction's TARGET contents (the real
+    ``website/dist`` build output the junction pointed at) instead of just
+    removing the link. Uses ``symlink_or_junction`` (a real symlink on POSIX,
+    an unprivileged directory junction on Windows) so this test exercises
+    the exact link type the bug needs on whichever platform runs it.
+    """
+    built = _repo_with_build(tmp_path)
+    static_dist = tmp_path / "src" / "kiro_crew" / "static" / "dist"
+    platform_compat.symlink_or_junction(str(built), str(static_dist))
+    assert platform_compat.is_link_or_junction(static_dist)
+
+    assert frontend._stage_dist(tmp_path / "website" / "dist", tmp_path) is True
+
+    assert not platform_compat.is_link_or_junction(
+        static_dist
+    ), "served dist must not alias website/dist"
+    assert static_dist.is_dir()
+    assert (static_dist / "index.html").is_file()
+    assert (static_dist / "assets" / "app-abc123.js").is_file()
+
+    # The decisive property: the link's ORIGINAL TARGET must survive staging.
+    # Before the fix, discarding the renamed-aside link deleted these through
+    # the junction instead of just removing the link.
+    assert built.is_dir()
+    assert (built / "index.html").is_file()
+    assert (built / "assets" / "app-abc123.js").is_file()
+
+
 def test_stage_built_dist_refreshes_an_existing_real_dir(tmp_path):
     """Re-staging overwrites a previously staged tree instead of merging it."""
     _repo_with_build(tmp_path)

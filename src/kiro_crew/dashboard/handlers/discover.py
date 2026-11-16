@@ -17,6 +17,7 @@ import shutil
 
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.dashboard.handlers._shared import _get_skills
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -420,15 +421,21 @@ async def api_skills_discover_install(request: web.Request) -> web.Response:
                     "Refusing bundle install outside skills root: %s", skill_dir
                 )
                 return 0
-            # Symlink defense: if the skill dir itself is a symlink, every
-            # containment check below resolves against the symlink TARGET, so
-            # a pre-planted link would redirect the whole bundle write outside
-            # the skills root (nested rel_paths traverse it via mkdir, and the
-            # parent-symlink guard below misses not-yet-existing parents).
-            # Remove the link itself — never follow it.
-            if skill_dir.is_symlink():
-                logger.warning("Replacing symlinked skill dir: %s", skill_dir)
-                skill_dir.unlink()
+            # Symlink defense: if the skill dir itself is a symlink (or, on
+            # Windows, a directory junction — the same reparse-point
+            # mechanism an app's own skill registration creates at this
+            # exact path shape via apps/bridges.py, and invisible to
+            # is_symlink()), every containment check below resolves against
+            # the link TARGET, so a pre-planted link would redirect the
+            # whole bundle write outside the skills root (nested rel_paths
+            # traverse it via mkdir, and the parent-symlink guard below
+            # misses not-yet-existing parents). Remove the link itself —
+            # never follow it, and never rmtree through it: shutil.rmtree
+            # treats a directory junction as an ordinary directory and
+            # recurses through to the target's real contents.
+            if platform_compat.is_link_or_junction(skill_dir):
+                logger.warning("Replacing linked skill dir: %s", skill_dir)
+                platform_compat.unlink_link_or_junction(skill_dir)
             # Overwrite semantics: clear the previous install first so stale
             # files from an older bundle version don't linger. The user
             # explicitly consented via the 409 -> overwrite flow.

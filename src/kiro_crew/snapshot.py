@@ -187,11 +187,26 @@ def _list_components() -> None:
 
 
 def _copytree_safe(src: Path, dst: Path, **kwargs) -> None:
-    """copytree that skips symlinks to prevent sensitive file leakage."""
+    """copytree that skips symlinks (and, on Windows, directory junctions)
+    to prevent sensitive file leakage.
+
+    ``os.path.islink`` is blind to a Windows directory junction — the same
+    reparse-point mechanism this codebase uses everywhere it links a
+    directory into place without symlink privilege (see
+    ``platform_compat.symlink_or_junction``), and one legitimately present
+    under ``~/.kiro/crew/skills/`` for every app-registered skill (see
+    ``apps/bridges.py``). An ``islink``-only filter lets such a junction sail
+    through untouched, and ``shutil.copytree`` then copies THROUGH it —
+    defeating the leak-prevention this function exists for.
+    """
     outer_ignore = kwargs.pop("ignore", None)
 
     def _ignore_symlinks(directory, contents):
-        skipped = {name for name in contents if os.path.islink(os.path.join(directory, name))}
+        skipped = {
+            name
+            for name in contents
+            if platform_compat.is_link_or_junction(os.path.join(directory, name))
+        }
         for name in skipped:
             print(f"⚠️  Skipping symlink in source tree: {os.path.join(directory, name)}")
         if outer_ignore:
@@ -202,15 +217,29 @@ def _copytree_safe(src: Path, dst: Path, **kwargs) -> None:
 
 
 def _copy_tree_no_overwrite(src: Path, dst: Path) -> None:
-    for item in src.rglob("*"):
-        if item.is_symlink():
-            continue
-        target = dst / item.relative_to(src)
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        elif item.is_file() and not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(item), str(target))
+    """Copy *src* into *dst* without overwriting, skipping any link/junction.
+
+    Walks with ``os.walk`` rather than ``Path.rglob`` so a linked directory
+    can be PRUNED from the walk — pruning ``os.walk``'s own ``dirs`` list
+    stops it from being descended into at all, whereas skipping a linked
+    entry found via ``rglob`` does nothing: rglob already queued that
+    directory's children as separate, ordinary-looking paths, so they are
+    yielded (and would be copied) regardless of the skip. That gap is exactly
+    how a Windows junction — invisible to ``is_symlink()`` — leaks its
+    target's contents through what looks like a symlink-safe copy.
+    """
+    for root, dirs, files in os.walk(src):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if not platform_compat.is_link_or_junction(root_path / d)]
+        dst_root = dst / root_path.relative_to(src)
+        dst_root.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            item = root_path / name
+            if platform_compat.is_link_or_junction(item):
+                continue
+            target = dst_root / name
+            if not target.exists():
+                shutil.copy2(str(item), str(target))
 
 
 # ── Snapshot ──────────────────────────────────────────────────────────────────

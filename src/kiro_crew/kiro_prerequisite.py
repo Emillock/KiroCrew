@@ -1332,6 +1332,36 @@ async def _run_process(
     wait_task = asyncio.create_task(proc.wait())
     cleanup_tasks = (*operation_tasks, wait_task)
 
+    async def _quiet_descendant_wait(awaitable: Awaitable[None]) -> bool:
+        """Await Windows descendant-tree bookkeeping without failing the probe.
+
+        Returns whether it completed cleanly. The tracker exists to retain
+        handles for ``_terminate_process``'s cleanup on a later timeout/
+        cancel — it does not decide whether the spawned process itself
+        succeeded; ``proc.wait()`` and the captured stdout/stderr below are
+        authoritative for that. A retained root handle can transiently fail
+        its identity re-read (e.g. the exit FILETIME not yet published while
+        a security scanner is still inspecting a freshly-installed binary),
+        which otherwise surfaces as ``descendant_termination_handles: root
+        handle identity mismatch`` and turns an already-successful
+        ``--version``/``whoami`` probe into a false "not installed" result.
+
+        Deliberately does NOT catch ``CancelledError``: this same helper also
+        awaits ``descendant_task``, and an external cancellation (this
+        operation's own timeout) can land on that await — swallowing it there
+        would stop the cancellation from ever reaching the caller and defeat
+        the timeout. The one future that legitimately needs quieting instead
+        (``primary_terminal_snapshot``, self-cancelled by the tracker's own
+        ``finally`` when its initial snapshot already failed) is skipped by
+        the caller rather than awaited here — see ``_wait_for_completion``.
+        """
+        try:
+            await awaitable
+        except Exception:
+            logger.debug("Windows descendant-tree bookkeeping failed", exc_info=True)
+            return False
+        return True
+
     async def _wait_for_completion() -> None:
         completion_tasks: list[Awaitable[Any]] = list(cleanup_tasks)
         if descendant_task is not None:
@@ -1341,15 +1371,22 @@ async def _run_process(
             # still running.
             # Shield the tracker from the operation timeout: the timeout path
             # still needs its latest retained handles while terminating the tree.
-            completion_tasks.append(asyncio.shield(descendant_task))
+            completion_tasks.append(asyncio.shield(_quiet_descendant_wait(descendant_task)))
+        initial_snapshot_ok = True
         if initial_snapshot is not None:
             # A fast launcher and its readers cannot finish the operation until
             # the exact-object primary snapshot has settled.
-            await initial_snapshot
-        if primary_terminal_snapshot is not None:
-            await asyncio.gather(primary_terminal_snapshot, *completion_tasks)
-        else:
-            await asyncio.gather(*completion_tasks)
+            initial_snapshot_ok = await _quiet_descendant_wait(initial_snapshot)
+        # The terminal snapshot is only ever resolved downstream of a
+        # successful initial snapshot (see _track_windows_descendants): when
+        # the initial snapshot instead raised, the tracker's own `finally`
+        # CANCELS this future rather than resolving it, and a cancelled
+        # future raises CancelledError on await — which must propagate
+        # untouched (see _quiet_descendant_wait), so it is skipped here
+        # instead of awaited.
+        if primary_terminal_snapshot is not None and initial_snapshot_ok:
+            await _quiet_descendant_wait(primary_terminal_snapshot)
+        await asyncio.gather(*completion_tasks)
 
     try:
         await asyncio.wait_for(
